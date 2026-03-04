@@ -54,15 +54,18 @@
     "npmRebuild": false,
     "publish": null,
     "nsis": {
-      "oneClick": false,
-      "allowToChangeInstallationDirectory": true,
+      "oneClick": true,
+      "allowToChangeInstallationDirectory": false,
       "installerIcon": "public/icon.ico",
-      "uninstallerIcon": "public/icon.ico"
+      "uninstallerIcon": "public/icon.ico",
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "RAMS Interactive Hub"
     },
     "win": {
       "target": [
         {
-          "target": "portable",
+          "target": "nsis",
           "arch": [
             "x64"
           ]

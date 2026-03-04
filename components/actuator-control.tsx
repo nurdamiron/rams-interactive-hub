@@ -112,6 +112,27 @@ export function ActuatorControl({ onClose, className = "" }: ActuatorControlProp
   // Use Electron IPC if available (avoids CORS), otherwise direct HTTP
   const electronApi = typeof window !== "undefined" ? (window as any).electron : null;
 
+  // Load actual LED state from Electron on mount (persist across modal open/close)
+  React.useEffect(() => {
+    const loadLedState = async () => {
+      if (electronApi?.getLedState) {
+        try {
+          const ledState = await electronApi.getLedState();
+          if (ledState) {
+            setAutoCycle(ledState.autoCycle);
+            if (ledState.mode?.startsWith('EFFECT_')) {
+              const effectId = parseInt(ledState.mode.replace('EFFECT_', ''), 10);
+              if (!isNaN(effectId)) setLedEffect(effectId);
+            }
+          }
+        } catch (e) {
+          console.error("Failed to load LED state:", e);
+        }
+      }
+    };
+    loadLedState();
+  }, [electronApi]);
+
   // LED Control Handlers — via IPC to avoid CORS issues
   const handleColorChange = async (hex: string) => {
     setLedColor(hex);

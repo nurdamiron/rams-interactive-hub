@@ -19,6 +19,7 @@ contextBridge.exposeInMainWorld('electron', {
   setLedBrightness: (brightness) => ipcRenderer.invoke('hardware-led-brightness', brightness),
   setLedSpeed: (speed) => ipcRenderer.invoke('hardware-led-speed', speed),
   getHardwareStatus: () => ipcRenderer.invoke('hardware-get-status'),
+  getLedState: () => ipcRenderer.invoke('hardware-get-led-state'),
   setEspIP: (ip) => ipcRenderer.invoke('hardware-set-ip', ip),
   pingHardware: () => ipcRenderer.invoke('hardware-ping'),
   sendHardwareCommand: (cmd) => ipcRenderer.invoke('hardware-send-command', cmd),

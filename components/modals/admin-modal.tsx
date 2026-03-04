@@ -128,7 +128,7 @@ export const AdminModal: React.FC<AdminModalProps> = ({
     loadDiag();
   }, [isOpen, activeTab, isElectron]);
 
-  // Load hardware status + block mapping + TV status
+  // Load hardware status + block mapping + TV status + LED state
   React.useEffect(() => {
     if (!isOpen || activeTab !== "hardware") return;
 
@@ -149,15 +149,31 @@ export const AdminModal: React.FC<AdminModalProps> = ({
       setHwBlockMapping(mapping);
     };
 
+    // Load actual LED state from Electron main process
+    const loadLedState = async () => {
+      if (isElectron && (window as any).electron?.getLedState) {
+        try {
+          const ledState = await (window as any).electron.getLedState();
+          if (ledState) {
+            setHwLedAutoCycle(ledState.autoCycle);
+            setHwLedMode(ledState.mode || "RAINBOW");
+          }
+        } catch (e) {
+          console.error("Failed to load LED state:", e);
+        }
+      }
+    };
+
     loadHwStatus();
     loadTvStatus();
     loadMapping();
+    loadLedState();
     const interval = setInterval(() => {
       loadHwStatus();
       loadTvStatus();
     }, 3000);
     return () => clearInterval(interval);
-  }, [isOpen, activeTab]);
+  }, [isOpen, activeTab, isElectron]);
 
   // Load saved visibility from localStorage
   React.useEffect(() => {

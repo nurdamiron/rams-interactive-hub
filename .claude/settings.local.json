@@ -1,0 +1,28 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(git checkout:*)",
+      "Bash(gh pr create:*)",
+      "Bash(where:*)",
+      "Bash(npm run dev:*)",
+      "Bash(npm run electron:dev:*)",
+      "Bash(npm run electron:build:win:*)",
+      "Bash(reg add \"HKCU\\\\Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Run\" /v \"RAMSInteractiveHub\" /t REG_SZ /d \"C:\\\\Users\\\\finecompKZ\\\\Desktop\\\\rams-projects-main\\\\rams-interactive-hub\\\\dist-new\\\\win-unpacked\\\\RAMS Interactive Hub.exe\" /f)",
+      "Bash(reg add \"HKCU\\\\Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Run\" /v \"RAMSInteractiveHub\" /t REG_SZ /d \"\"\"C:\\\\Users\\\\finecompKZ\\\\Desktop\\\\rams-projects-main\\\\rams-interactive-hub\\\\dist-new\\\\win-unpacked\\\\RAMS Interactive Hub.exe\"\"\" /f)",
+      "Bash(cmd.exe /c 'reg add \"\"HKCU\\\\Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Run\"\" /v \"\"RAMSInteractiveHub\"\" /t REG_SZ /d \"\"C:\\\\Users\\\\finecompKZ\\\\Desktop\\\\rams-projects-main\\\\rams-interactive-hub\\\\dist-new\\\\win-unpacked\\\\RAMS Interactive Hub.exe\"\" /f')",
+      "Bash(powershell -Command \"Set-ItemProperty -Path ''HKCU:\\\\Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Run'' -Name ''RAMSInteractiveHub'' -Value ''\"\"C:\\\\Users\\\\finecompKZ\\\\Desktop\\\\rams-projects-main\\\\rams-interactive-hub\\\\dist-new\\\\win-unpacked\\\\RAMS Interactive Hub.exe\"\"''\")",
+      "Bash(powershell -Command \"Get-ItemProperty -Path ''HKCU:\\\\Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Run'' -Name ''RAMSInteractiveHub''\")",
+      "Bash(npx asar:*)",
+      "Bash(tasklist:*)",
+      "Bash(powershell -Command:*)",
+      "Bash(npx electron-builder:*)",
+      "Bash(netstat:*)",
+      "Bash(npm run prebuild:icon:*)",
+      "Bash(npm run build:*)",
+      "Bash(node -e:*)"
+    ]
+  }
+}

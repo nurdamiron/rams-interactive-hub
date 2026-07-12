@@ -1156,11 +1156,13 @@ app.whenReady().then(() => {
   });
 
   // ---- LED Auto-Cycle + Rainbow state ----
-  let ledAutoCycleTimer = null;
+  // AUTO mode is delegated to the ESP32 firmware's own /api/autocycle (esp32_master) —
+  // it cycles through all 8 built-in effects every interval on its own, and survives
+  // Electron/browser restarts. We only keep a client-side timer for the manual RAINBOW
+  // mode below (a deliberate single-effect color sweep, not the "cycle everything" mode).
+  let firmwareAutoCycleOn = false;
   let ledRainbowTimer = null;
   let ledRainbowHue = 0;
-  let ledAutoCycleIndex = 0;
-  const LED_MODE_ORDER = ['WAVE', 'PULSE', 'SPARKLE', 'FIRE'];
   const modeToFwId = {
     'WAVE': 3, 'PULSE': 4, 'SPARKLE': 5, 'FIRE': 6,
     'CHASE': 3, 'STATIC': 3, 'RAINBOW': 3, 'METEOR': 3,
@@ -1193,42 +1195,31 @@ app.whenReady().then(() => {
     }
   }
 
+  // Stops both the manual client-side rainbow sweep AND the firmware's native
+  // auto-cycle, so a manual mode/effect pick doesn't get silently overridden
+  // 60s later by auto-cycle still running on the ESP32.
   function stopLedAutoCycle() {
-    if (ledAutoCycleTimer) {
-      clearInterval(ledAutoCycleTimer);
-      ledAutoCycleTimer = null;
-      log('[LED] Auto-cycle stopped');
-    }
     stopRainbowCycle();
+    if (firmwareAutoCycleOn) {
+      firmwareAutoCycleOn = false;
+      log('[LED] Firmware auto-cycle stopped');
+      sendHttpRequest('/api/autocycle', { enabled: 0 }).catch(() => {});
+    }
   }
 
   ipcMain.handle('hardware-led-mode', async (_event, mode) => {
     const upperMode = mode.toUpperCase();
 
-    // Handle AUTO mode — effects + rainbow color cycling
+    // Handle AUTO mode — firmware cycles all 8 effects natively every 60s
     if (upperMode === 'AUTO') {
-      if (ledAutoCycleTimer) {
+      if (firmwareAutoCycleOn) {
         stopLedAutoCycle();
         return { autoCycle: false };
       }
-      log('[LED] Auto-cycle started (60s interval) + rainbow colors');
-      ledAutoCycleIndex = 0;
-
-      // Start rainbow color cycling (smooth hue rotation)
+      log('[LED] Auto-cycle ON (firmware-driven, all 8 effects, 60s interval)');
+      firmwareAutoCycleOn = true;
       await sendHttpRequest('/api/bri', { v: 200 });
-      await sendHttpRequest('/api/effect', { id: 3 }); // Wave as base
-      startRainbowCycle();
-
-      // Switch effects every 60 seconds
-      const cycleFn = async () => {
-        const modeName = LED_MODE_ORDER[ledAutoCycleIndex % LED_MODE_ORDER.length];
-        const fwId = modeToFwId[modeName];
-        log(`[LED AutoCycle] → ${modeName} (FW id=${fwId}) + rainbow`);
-        await sendHttpRequest('/api/effect', { id: fwId });
-        ledAutoCycleIndex++;
-      };
-      await cycleFn();
-      ledAutoCycleTimer = setInterval(cycleFn, 60 * 1000);
+      await sendHttpRequest('/api/autocycle', { enabled: 1, interval: 60 });
       return { autoCycle: true };
     }
 

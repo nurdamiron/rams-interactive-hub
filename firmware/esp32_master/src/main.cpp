@@ -80,7 +80,9 @@ unsigned long lastLedUpdate = 0;
 uint16_t animCounter        = 0;
 
 // Auto-cycle: rotate effects every N seconds
-bool     autoCycleEnabled   = false;
+// ВКЛЮЧЕНО по умолчанию — переживает любой рестарт ESP32 (перезагрузка,
+// сбой питания, OTA-обновление), не зависит от Next.js/Electron клиента.
+bool     autoCycleEnabled   = true;
 uint32_t autoCycleInterval  = 60000;  // ms (default 1 minute)
 unsigned long lastAutoCycle = 0;
 

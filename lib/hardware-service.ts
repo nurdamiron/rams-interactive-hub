@@ -123,11 +123,30 @@ export const hardwareService = {
   },
 
   /**
-   * Set LED mode (RAINBOW, PULSE, WAVE, STATIC, OFF)
+   * Set LED mode.
+   * Эффекты esp32_master: STATIC, PULSE, RAINBOW, CHASE, SPARKLE, WAVE, FIRE, METEOR, OFF.
+   * "AUTO" переключает (toggle) прошивочный авто-цикл — для явного вкл/выкл
+   * используй setLedAutoCycle().
    */
   async setLedMode(mode: string): Promise<boolean> {
     const hw = HardwareIPCService.getInstance();
     return hw.setLedMode(mode);
+  },
+
+  /**
+   * Включить/выключить прошивочный авто-цикл эффектов (явно, без toggle)
+   */
+  async setLedAutoCycle(enabled: boolean, interval: number = 60): Promise<boolean> {
+    const hw = HardwareIPCService.getInstance();
+    return hw.setLedAutoCycle(enabled, interval);
+  },
+
+  /**
+   * Текущее состояние прошивочного авто-цикла
+   */
+  async getLedAutoCycle(): Promise<{ autoCycle: boolean; interval: number } | null> {
+    const hw = HardwareIPCService.getInstance();
+    return hw.getLedAutoCycle();
   },
 
   /**

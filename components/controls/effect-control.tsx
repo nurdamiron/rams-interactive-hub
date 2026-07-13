@@ -1,6 +1,6 @@
 "use client"
 
-import { useState, useEffect, useRef } from "react"
+import { useState, useEffect } from "react"
 import { motion, AnimatePresence } from "framer-motion"
 import { Sparkles, Waves, Flame, Zap, ChevronDown, ChevronUp, RefreshCw } from "lucide-react"
 import { ESP32Client } from "@/lib/esp32-client"
@@ -30,7 +30,6 @@ export function EffectControl({ esp32Client, className }: EffectControlProps) {
   const [isLoading, setIsLoading] = useState(false)
   const [autoCycle, setAutoCycle] = useState(false)
   const [cycleInterval, setCycleInterval] = useState(60)
-  const autoCycleTimer = useRef<ReturnType<typeof setInterval> | null>(null)
 
   // Use Electron IPC if available (avoids CORS)
   const electronApi = typeof window !== "undefined" ? (window as any).electron : null
@@ -43,37 +42,59 @@ export function EffectControl({ esp32Client, className }: EffectControlProps) {
     }
   }
 
-  // Auto-cycle: switch effect every N seconds (stable ref to avoid interval recreation)
-  const selectedEffectRef = useRef(selectedEffect)
-  selectedEffectRef.current = selectedEffect
-
-  useEffect(() => {
-    if (autoCycleTimer.current) {
-      clearInterval(autoCycleTimer.current)
-      autoCycleTimer.current = null
-    }
-    if (autoCycle) {
-      const switchNext = async () => {
-        const nextId = (selectedEffectRef.current + 1) % EFFECTS.length
-        try {
-          await sendEffect(nextId)
-          setSelectedEffect(nextId)
-          console.log(`[AutoCycle] → ${EFFECTS[nextId].name} (id=${nextId})`)
-        } catch (error) {
-          console.error(`[AutoCycle] Failed:`, error)
-        }
+  // Auto-cycle делегирован прошивке (/api/autocycle) — она сама переключает все
+  // 8 эффектов и переживает рестарты приложения. Никаких клиентских таймеров.
+  const setFirmwareAutoCycle = async (enabled: boolean, intervalSec: number) => {
+    try {
+      if (electronApi?.setLedAutoCycle) {
+        await electronApi.setLedAutoCycle(enabled, intervalSec)
+      } else {
+        await esp32Client.setAutoCycle(enabled, intervalSec)
       }
-      autoCycleTimer.current = setInterval(switchNext, cycleInterval * 1000)
+      console.log(`[AutoCycle] Firmware auto-cycle ${enabled ? "ON" : "OFF"} (${intervalSec}s)`)
+    } catch (error) {
+      console.error(`[AutoCycle] Failed:`, error)
     }
-    return () => {
-      if (autoCycleTimer.current) clearInterval(autoCycleTimer.current)
+  }
+
+  const handleAutoCycleToggle = async () => {
+    const newState = !autoCycle
+    setAutoCycle(newState)
+    await setFirmwareAutoCycle(newState, cycleInterval)
+  }
+
+  const handleCycleIntervalChange = async (sec: number) => {
+    setCycleInterval(sec)
+    if (autoCycle) await setFirmwareAutoCycle(true, sec)
+  }
+
+  // Синхронизация с реальным состоянием прошивки (после ребута ESP32 авто-цикл ON)
+  useEffect(() => {
+    const sync = async () => {
+      try {
+        const state = electronApi?.getLedAutoCycle
+          ? await electronApi.getLedAutoCycle()
+          : await esp32Client.getAutoCycle()
+        if (state && typeof state.autoCycle === "boolean") {
+          setAutoCycle(state.autoCycle)
+          if (state.interval) setCycleInterval(state.interval)
+        }
+      } catch {
+        // ESP32 недоступен — оставляем локальное состояние
+      }
     }
-  }, [autoCycle, cycleInterval, esp32Client, electronApi])
+    sync()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   const handleEffectChange = async (effectId: number) => {
     try {
       setIsLoading(true)
-      if (autoCycle) setAutoCycle(false)
+      if (autoCycle) {
+        setAutoCycle(false)
+        // В Electron main.js сам шлёт autocycle=0 при выборе эффекта
+        if (!electronApi?.setLedEffect) await esp32Client.setAutoCycle(false)
+      }
       await sendEffect(effectId)
       setSelectedEffect(effectId)
     } catch (error) {
@@ -201,7 +222,7 @@ export function EffectControl({ esp32Client, className }: EffectControlProps) {
               {/* Auto-Cycle Control */}
               <div className="space-y-2 pt-2 border-t border-white/10">
                 <button
-                  onClick={() => setAutoCycle(!autoCycle)}
+                  onClick={handleAutoCycleToggle}
                   className={cn(
                     "w-full flex items-center justify-between px-3 py-2 rounded-lg border transition-all",
                     autoCycle
@@ -229,7 +250,7 @@ export function EffectControl({ esp32Client, className }: EffectControlProps) {
                       {[30, 60, 120, 300].map((sec) => (
                         <button
                           key={sec}
-                          onClick={() => setCycleInterval(sec)}
+                          onClick={() => handleCycleIntervalChange(sec)}
                           className={cn(
                             "flex-1 py-1.5 rounded text-xs font-medium transition-colors",
                             cycleInterval === sec

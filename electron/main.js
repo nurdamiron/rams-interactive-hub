@@ -303,6 +303,25 @@ function sendHttpRequest(endpoint, params = {}) {
   });
 }
 
+// GET JSON from ESP32 (read-only state queries, e.g. /api/autocycle, /api/state)
+function httpGetJson(endpoint) {
+  return new Promise((resolve) => {
+    const url = `http://${espIP}:${ESP32_PORT}${endpoint}`;
+    const req = http.get(url, { timeout: 5000 }, (res) => {
+      let data = '';
+      res.on('data', (chunk) => { data += chunk; });
+      res.on('end', () => {
+        if (res.statusCode === 200) {
+          try { resolve(JSON.parse(data)); return; } catch (e) { /* fallthrough */ }
+        }
+        resolve(null);
+      });
+    });
+    req.on('error', () => resolve(null));
+    req.on('timeout', () => { req.destroy(); resolve(null); });
+  });
+}
+
 // Debounced block command - with HTTP API
 let pendingResolve = null;
 
@@ -1155,91 +1174,74 @@ app.whenReady().then(() => {
     return sendHttpRequest('/api/all', { action: 'down' });
   });
 
-  // ---- LED Auto-Cycle + Rainbow state ----
+  // ---- LED Auto-Cycle state ----
   // AUTO mode is delegated to the ESP32 firmware's own /api/autocycle (esp32_master) —
-  // it cycles through all 8 built-in effects every interval on its own, and survives
-  // Electron/browser restarts. We only keep a client-side timer for the manual RAINBOW
-  // mode below (a deliberate single-effect color sweep, not the "cycle everything" mode).
+  // it cycles through all 8 built-in effects on its own and survives Electron restarts.
+  // The firmware boots with auto-cycle ENABLED, so the local flag is synced from the
+  // device instead of assuming it starts off.
   let firmwareAutoCycleOn = false;
-  let ledRainbowTimer = null;
-  let ledRainbowHue = 0;
+  // esp32_master effect IDs (src/main.cpp enum LedMode)
   const modeToFwId = {
-    'WAVE': 3, 'PULSE': 4, 'SPARKLE': 5, 'FIRE': 6,
-    'CHASE': 3, 'STATIC': 3, 'RAINBOW': 3, 'METEOR': 3,
+    'STATIC': 0, 'PULSE': 1, 'RAINBOW': 2, 'CHASE': 3,
+    'SPARKLE': 4, 'WAVE': 5, 'FIRE': 6, 'METEOR': 7,
   };
 
-  // HSL to RGB for rainbow
-  function hslToRgb(h, s, l) {
-    s /= 100; l /= 100;
-    const k = n => (n + h / 30) % 12;
-    const a = s * Math.min(l, 1 - l);
-    const f = n => l - a * Math.max(-1, Math.min(k(n) - 3, Math.min(9 - k(n), 1)));
-    return [Math.round(f(0) * 255), Math.round(f(8) * 255), Math.round(f(4) * 255)];
-  }
-
-  function startRainbowCycle() {
-    if (ledRainbowTimer) return;
-    log('[LED] Rainbow color cycling started');
-    ledRainbowTimer = setInterval(() => {
-      ledRainbowHue = (ledRainbowHue + 3) % 360;
-      const [r, g, b] = hslToRgb(ledRainbowHue, 100, 50);
-      sendHttpRequest('/api/color', { r, g, b }).catch(() => {});
-    }, 150);
-  }
-
-  function stopRainbowCycle() {
-    if (ledRainbowTimer) {
-      clearInterval(ledRainbowTimer);
-      ledRainbowTimer = null;
-      log('[LED] Rainbow color cycling stopped');
+  async function syncAutoCycleState() {
+    const state = await httpGetJson('/api/autocycle');
+    if (state && typeof state.autoCycle === 'boolean') {
+      firmwareAutoCycleOn = state.autoCycle;
+      log(`[LED] Firmware auto-cycle synced: ${firmwareAutoCycleOn ? 'ON' : 'OFF'}`);
     }
+    return state;
   }
+  syncAutoCycleState();
 
-  // Stops both the manual client-side rainbow sweep AND the firmware's native
-  // auto-cycle, so a manual mode/effect pick doesn't get silently overridden
-  // 60s later by auto-cycle still running on the ESP32.
+  // Disable unconditionally: the firmware boots with auto-cycle ON, so gating this
+  // on the local flag would skip the request after an Electron restart and the
+  // firmware would silently override a manual mode/effect pick up to 60s later.
   function stopLedAutoCycle() {
-    stopRainbowCycle();
-    if (firmwareAutoCycleOn) {
-      firmwareAutoCycleOn = false;
-      log('[LED] Firmware auto-cycle stopped');
-      sendHttpRequest('/api/autocycle', { enabled: 0 }).catch(() => {});
-    }
+    firmwareAutoCycleOn = false;
+    sendHttpRequest('/api/autocycle', { enabled: 0 }).catch(() => {});
   }
+
+  async function setLedAutoCycle(enabled, interval = 60) {
+    firmwareAutoCycleOn = !!enabled;
+    if (enabled) {
+      await sendHttpRequest('/api/bri', { v: 200 });
+      await sendHttpRequest('/api/autocycle', { enabled: 1, interval });
+      log(`[LED] Firmware auto-cycle ON (interval ${interval}s)`);
+    } else {
+      await sendHttpRequest('/api/autocycle', { enabled: 0 });
+      log('[LED] Firmware auto-cycle OFF');
+    }
+    return { autoCycle: firmwareAutoCycleOn, interval };
+  }
+
+  ipcMain.handle('hardware-led-autocycle', async (_event, enabled, interval) => {
+    return setLedAutoCycle(enabled, interval || 60);
+  });
+
+  ipcMain.handle('hardware-led-autocycle-get', async () => {
+    const state = await syncAutoCycleState();
+    return state || { autoCycle: firmwareAutoCycleOn, interval: 60 };
+  });
 
   ipcMain.handle('hardware-led-mode', async (_event, mode) => {
     const upperMode = mode.toUpperCase();
 
-    // Handle AUTO mode — firmware cycles all 8 effects natively every 60s
+    // AUTO toggles the firmware auto-cycle. Sync first so the toggle works even
+    // right after boot, when the firmware default is ON but Electron just started.
     if (upperMode === 'AUTO') {
-      if (firmwareAutoCycleOn) {
-        stopLedAutoCycle();
-        return { autoCycle: false };
-      }
-      log('[LED] Auto-cycle ON (firmware-driven, all 8 effects, 60s interval)');
-      firmwareAutoCycleOn = true;
-      await sendHttpRequest('/api/bri', { v: 200 });
-      await sendHttpRequest('/api/autocycle', { enabled: 1, interval: 60 });
-      return { autoCycle: true };
+      await syncAutoCycleState();
+      return setLedAutoCycle(!firmwareAutoCycleOn);
     }
 
-    // Handle RAINBOW mode (manual)
-    if (upperMode === 'RAINBOW') {
-      stopLedAutoCycle();
-      log('[LED] Rainbow mode — wave + color cycling');
-      await sendHttpRequest('/api/bri', { v: 200 });
-      await sendHttpRequest('/api/effect', { id: 3 });
-      startRainbowCycle();
-      return true;
-    }
-
-    // Any other mode stops auto-cycle and rainbow
+    // Any manual mode stops auto-cycle
     stopLedAutoCycle();
 
-    // Handle OFF — just set brightness to 0
     if (upperMode === 'OFF') {
-      log(`[LED] Mode OFF — brightness 0`);
-      return await sendHttpRequest('/api/bri', { v: 0 });
+      log('[LED] Mode OFF');
+      return await sendHttpRequest('/api/led', { mode: 'OFF' });
     }
 
     const fwId = modeToFwId[upperMode];
@@ -1310,8 +1312,9 @@ app.whenReady().then(() => {
     if (cmd === 'ALL:STOP') return sendHttpRequest('/api/stop');
     if (cmd === 'ALL:DOWN') return sendHttpRequest('/api/all', { action: 'down' });
     if (cmd.startsWith('LED:MODE:')) {
-      const modeToFwId = { 'STATIC': 2, 'PULSE': 1, 'RAINBOW': 0, 'CHASE': 3, 'SPARKLE': 5, 'WAVE': 3, 'FIRE': 6, 'METEOR': 7, 'OFF': 4 };
-      const fwId = modeToFwId[cmd.split(':')[2].toUpperCase()];
+      const modeName = cmd.split(':')[2].toUpperCase();
+      if (modeName === 'OFF') return sendHttpRequest('/api/led', { mode: 'OFF' });
+      const fwId = modeToFwId[modeName];
       if (fwId !== undefined) return sendHttpRequest('/api/effect', { id: fwId });
       return false;
     }

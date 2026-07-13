@@ -41,7 +41,11 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({
     const updateStats = async () => {
       try {
         const status = await esp32Client.getStatus();
-        setBlockStats({ active: status.active, blocks: status.blocks });
+        // esp32_master: blocks = ["stop","up",...] по индексу блока; собираем номера поднятых
+        const upBlocks = (status.blocks ?? [])
+          .map((state, i) => (state === "up" ? i + 1 : 0))
+          .filter((n) => n > 0);
+        setBlockStats({ active: status.activeBlocks ?? upBlocks.length, blocks: upBlocks });
       } catch (err) {
         console.error("[ControlPanel] Failed to get status:", err);
       }

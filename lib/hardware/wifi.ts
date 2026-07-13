@@ -17,6 +17,8 @@ interface ElectronAPI {
   allStop: () => Promise<boolean>;
   allDown: () => Promise<boolean>;
   setLedMode: (mode: string) => Promise<boolean>;
+  setLedAutoCycle: (enabled: boolean, interval?: number) => Promise<{ autoCycle: boolean; interval: number }>;
+  getLedAutoCycle: () => Promise<{ autoCycle: boolean; interval: number }>;
   setLedColor: (hexColor: string) => Promise<boolean>;
   setLedBrightness: (brightness: number) => Promise<boolean>;
   getHardwareStatus: () => Promise<HardwareStatus>;
@@ -115,6 +117,29 @@ class HardwareIPCService {
     } catch (e) {
       console.warn("[Hardware] setLedMode failed:", e);
       return false;
+    }
+  }
+
+  async setLedAutoCycle(enabled: boolean, interval: number = 60): Promise<boolean> {
+    const api = getElectronAPI();
+    if (!api) return false;
+    try {
+      const result = await api.setLedAutoCycle(enabled, interval);
+      return result.autoCycle === enabled;
+    } catch (e) {
+      console.warn("[Hardware] setLedAutoCycle failed:", e);
+      return false;
+    }
+  }
+
+  async getLedAutoCycle(): Promise<{ autoCycle: boolean; interval: number } | null> {
+    const api = getElectronAPI();
+    if (!api) return null;
+    try {
+      return await api.getLedAutoCycle();
+    } catch (e) {
+      console.warn("[Hardware] getLedAutoCycle failed:", e);
+      return null;
     }
   }
 

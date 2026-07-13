@@ -13,11 +13,35 @@ export interface BlockStatus {
   isActive: boolean;
 }
 
+// Per-block state as reported by esp32_master /api/status
+export type BlockState = "up" | "down" | "stop";
+
 export interface ESP32Status {
-  active: number;
-  blocks: number[];
-  mega1Alive?: boolean;
-  mega2Alive?: boolean;
+  ok: boolean;
+  activeBlocks: number;
+  blocks: BlockState[]; // index 0 = block 1
+  mega1?: "ok" | "dead";
+  mega2?: "ok" | "dead";
+  apIP?: string;
+  staIP?: string;
+  staConnected?: boolean;
+}
+
+export interface AutoCycleState {
+  autoCycle: boolean;
+  interval: number; // seconds
+  currentEffect?: number;
+}
+
+export interface LEDState {
+  r: number;
+  g: number;
+  b: number;
+  bri: number;
+  spd: number;
+  fx: number;
+  autoCycle: boolean;
+  autoCycleInterval: number;
 }
 
 export interface LEDConfig {
@@ -73,7 +97,7 @@ export class ESP32Client {
       throw new Error(`Failed to get status: ${response.statusText}`);
     }
     const data = await response.json();
-    console.log(`[ESP32Client] ✅ Status: active=${data.active}, blocks=[${data.blocks}]`);
+    console.log(`[ESP32Client] ✅ Status: activeBlocks=${data.activeBlocks}, blocks=[${data.blocks}]`);
     return data;
   }
 
@@ -120,11 +144,12 @@ export class ESP32Client {
 
   /**
    * LED УПРАВЛЕНИЕ
-   * ESP32 v3.2 API: /api/effect, /api/color, /api/bri, /api/spd
+   * esp32_master API: /api/effect, /api/color, /api/bri, /api/spd, /api/autocycle, /api/state
    *
-   * Рабочие эффекты на ESP32 v3.2: 3=Wave, 4=Pulse, 5=Sparkle, 6=Fire
-   * IDs 0-2 принимаются но визуально не меняются
-   * UI отправляет firmware ID напрямую (без маппинга)
+   * Эффекты esp32_master (src/main.cpp enum LedMode):
+   *   0=Static, 1=Pulse, 2=Rainbow, 3=Chase, 4=Sparkle, 5=Wave, 6=Fire, 7=Meteor
+   * UI отправляет firmware ID напрямую (без маппинга).
+   * ВАЖНО: /api/color принудительно переключает режим в Static (main.cpp handleColor).
    */
 
   /**
@@ -192,11 +217,53 @@ export class ESP32Client {
   }
 
   /**
-   * Выключить LED (brightness=0)
+   * Выключить LED (режим OFF в прошивке — strip.clear())
    */
   async setLEDOff(): Promise<void> {
-    await this.setLEDBrightness(0);
+    const response = await this.fetchWithRetry("/api/led?mode=OFF", { method: "POST" });
+    if (!response.ok) {
+      throw new Error(`Failed to turn LED off: ${response.statusText}`);
+    }
     console.log(`[ESP32Client] ✅ LED OFF`);
+  }
+
+  /**
+   * Включить/выключить прошивочный авто-цикл эффектов.
+   * Прошивка сама переключает все 8 эффектов каждые interval секунд
+   * и стартует с включённым авто-циклом после каждого ребута.
+   */
+  async setAutoCycle(enabled: boolean, intervalSec: number = 60): Promise<AutoCycleState> {
+    const url = `/api/autocycle?enabled=${enabled ? 1 : 0}&interval=${intervalSec}`;
+    console.log(`[ESP32Client] POST ${this.baseUrl}${url}`);
+    const response = await this.fetchWithRetry(url, { method: "POST" });
+    if (!response.ok) {
+      throw new Error(`Failed to set auto-cycle: ${response.statusText}`);
+    }
+    const data = await response.json();
+    console.log(`[ESP32Client] ✅ AutoCycle ${data.autoCycle ? "ON" : "OFF"} (interval ${data.interval}s)`);
+    return data;
+  }
+
+  /**
+   * Получить текущее состояние авто-цикла
+   */
+  async getAutoCycle(): Promise<AutoCycleState> {
+    const response = await this.fetchWithRetry("/api/autocycle", { method: "GET" });
+    if (!response.ok) {
+      throw new Error(`Failed to get auto-cycle state: ${response.statusText}`);
+    }
+    return response.json();
+  }
+
+  /**
+   * Получить полное состояние LED (цвет, яркость, скорость, эффект, авто-цикл)
+   */
+  async getState(): Promise<LEDState> {
+    const response = await this.fetchWithRetry("/api/state", { method: "GET" });
+    if (!response.ok) {
+      throw new Error(`Failed to get LED state: ${response.statusText}`);
+    }
+    return response.json();
   }
 
   /**
@@ -215,11 +282,11 @@ export class ESP32Client {
   }
 
   /**
-   * Получить статус конкретного блока
+   * Получить статус конкретного блока (поднят ли)
    */
   async getBlockStatus(blockNum: number): Promise<boolean> {
     const status = await this.getStatus();
-    return status.blocks.includes(blockNum);
+    return status.blocks?.[blockNum - 1] === "up";
   }
 
   /**
@@ -343,7 +410,8 @@ export async function discoverESP32(subnet: string = "192.168.110", port: number
           .then(async (res) => {
             if (!res.ok) return null;
             const data = await res.json();
-            if (data.hasOwnProperty("active") && data.hasOwnProperty("blocks")) {
+            // esp32_master отдаёт activeBlocks; старые прошивки — active
+            if (Array.isArray(data.blocks) && ("activeBlocks" in data || "active" in data)) {
               console.log(`[ESP32Discovery] ✅ Found ESP32 at ${ip}`);
               return ip;
             }

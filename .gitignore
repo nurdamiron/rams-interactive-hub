@@ -97,3 +97,6 @@ next-env.d.ts
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+
+# graphify knowledge-graph output
+graphify-out/

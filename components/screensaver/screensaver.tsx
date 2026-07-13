@@ -100,12 +100,15 @@ export const Screensaver: React.FC<ScreensaverProps> = ({
     };
   }, [resetTimer]);
 
-  // Hardware control when screensaver activates/deactivates
+  // Hardware control when screensaver activates/deactivates.
+  // В простое отдаём ленту прошивочному авто-циклу (все 8 эффектов, каждые 60с) —
+  // он работает на самом ESP32 и не зависит от приложения.
   React.useEffect(() => {
     if (isActive) {
       hardwareService.resetAll();
-      hardwareService.setLedMode("RAINBOW"); // Rainbow = Wave + smooth color cycling
+      hardwareService.setLedAutoCycle(true);
     } else {
+      hardwareService.setLedAutoCycle(false);
       hardwareService.setLedMode("WAVE");
     }
   }, [isActive]);

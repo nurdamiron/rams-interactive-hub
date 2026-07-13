@@ -14,6 +14,8 @@ contextBridge.exposeInMainWorld('electron', {
   allStop: () => ipcRenderer.invoke('hardware-all-stop'),
   allDown: () => ipcRenderer.invoke('hardware-all-down'),
   setLedMode: (mode) => ipcRenderer.invoke('hardware-led-mode', mode),
+  setLedAutoCycle: (enabled, interval) => ipcRenderer.invoke('hardware-led-autocycle', enabled, interval),
+  getLedAutoCycle: () => ipcRenderer.invoke('hardware-led-autocycle-get'),
   setLedEffect: (effectId, speed) => ipcRenderer.invoke('hardware-led-effect', effectId, speed),
   setLedColor: (hexColor) => ipcRenderer.invoke('hardware-led-color', hexColor),
   setLedBrightness: (brightness) => ipcRenderer.invoke('hardware-led-brightness', brightness),

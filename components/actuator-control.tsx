@@ -98,9 +98,9 @@ export function ActuatorControl({ onClose, className = "" }: ActuatorControlProp
     }
   };
 
-  // Проверка активности блока
+  // Проверка активности блока (esp32_master: blocks = ["stop","up","down",...])
   const isBlockActive = (blockNum: number): boolean => {
-    return status?.blocks.includes(blockNum) ?? false;
+    return status?.blocks?.[blockNum - 1] === "up";
   };
 
   // Определить тип блока (OUTER/INNER)
@@ -160,9 +160,12 @@ export function ActuatorControl({ onClose, className = "" }: ActuatorControlProp
     if (autoCycle) setAutoCycle(false);
 
     try {
+      // Ручной выбор эффекта отключает прошивочный авто-цикл, иначе прошивка
+      // перещёлкнет эффект сама через ≤interval секунд
       if (electronApi?.setLedEffect) {
-        await electronApi.setLedEffect(effectId);
+        await electronApi.setLedEffect(effectId); // main.js сам шлёт autocycle=0
       } else {
+        if (autoCycle) await client.setAutoCycle(false);
         await client.setLEDEffect(effectId);
       }
       console.log(`[LED] Effect changed to ID ${effectId}`);
@@ -171,39 +174,51 @@ export function ActuatorControl({ onClose, className = "" }: ActuatorControlProp
     }
   };
 
-  // Auto-cycle: switch between effects
-  const autoCycleRef = React.useRef<ReturnType<typeof setInterval> | null>(null);
-  const ledEffectRef = React.useRef(ledEffect);
-  ledEffectRef.current = ledEffect;
+  // Auto-cycle делегирован прошивке (/api/autocycle) — она сама переключает все
+  // 8 эффектов и переживает рестарты приложения. Никаких клиентских таймеров.
+  const setFirmwareAutoCycle = React.useCallback(async (enabled: boolean, intervalSec: number) => {
+    try {
+      if (electronApi?.setLedAutoCycle) {
+        await electronApi.setLedAutoCycle(enabled, intervalSec);
+      } else {
+        await client.setAutoCycle(enabled, intervalSec);
+      }
+      console.log(`[AutoCycle] Firmware auto-cycle ${enabled ? "ON" : "OFF"} (${intervalSec}s)`);
+    } catch (err) {
+      console.error("Failed to set firmware auto-cycle:", err);
+    }
+  }, [client, electronApi]);
 
+  const handleAutoCycleToggle = async () => {
+    const newState = !autoCycle;
+    setAutoCycle(newState);
+    await setFirmwareAutoCycle(newState, cycleInterval);
+  };
+
+  const handleCycleIntervalChange = async (sec: number) => {
+    setCycleInterval(sec);
+    if (autoCycle) await setFirmwareAutoCycle(true, sec);
+  };
+
+  // Синхронизация с реальным состоянием прошивки при открытии панели
+  // (после ребута ESP32 авто-цикл включён по умолчанию)
   React.useEffect(() => {
-    if (autoCycleRef.current) {
-      clearInterval(autoCycleRef.current);
-      autoCycleRef.current = null;
-    }
-    if (autoCycle) {
-      const switchNext = async () => {
-        const currentIdx = LED_EFFECTS.findIndex(e => e.id === ledEffectRef.current);
-        const nextIdx = (currentIdx + 1) % LED_EFFECTS.length;
-        const nextEffect = LED_EFFECTS[nextIdx];
-        setLedEffect(nextEffect.id);
-        try {
-          if (electronApi?.setLedEffect) {
-            await electronApi.setLedEffect(nextEffect.id);
-          } else {
-            await client.setLEDEffect(nextEffect.id);
-          }
-          console.log(`[AutoCycle] → ${nextEffect.name} (FW ID=${nextEffect.id})`);
-        } catch (err) {
-          console.error("Auto-cycle failed:", err);
+    const sync = async () => {
+      try {
+        const state = electronApi?.getLedAutoCycle
+          ? await electronApi.getLedAutoCycle()
+          : await client.getAutoCycle();
+        if (state && typeof state.autoCycle === "boolean") {
+          setAutoCycle(state.autoCycle);
+          if (state.interval) setCycleInterval(state.interval);
         }
-      };
-      autoCycleRef.current = setInterval(switchNext, cycleInterval * 1000);
-    }
-    return () => {
-      if (autoCycleRef.current) clearInterval(autoCycleRef.current);
+      } catch {
+        // ESP32 недоступен — оставляем локальное состояние
+      }
     };
-  }, [autoCycle, cycleInterval, client, electronApi]);
+    sync();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   return (
     <div className={`fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm ${className}`}>
@@ -429,7 +444,7 @@ export function ActuatorControl({ onClose, className = "" }: ActuatorControlProp
                 <div className="flex items-center justify-between mb-4">
                   <h3 className="text-lg font-bold text-white">Эффекты</h3>
                   <button
-                    onClick={() => setAutoCycle(!autoCycle)}
+                    onClick={handleAutoCycleToggle}
                     className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm font-medium transition-all ${
                       autoCycle
                         ? "bg-cyan-600 text-white"
@@ -447,7 +462,7 @@ export function ActuatorControl({ onClose, className = "" }: ActuatorControlProp
                     {[30, 60, 120, 300].map((sec) => (
                       <button
                         key={sec}
-                        onClick={() => setCycleInterval(sec)}
+                        onClick={() => handleCycleIntervalChange(sec)}
                         className={`flex-1 py-2 rounded-lg text-sm font-medium transition-all ${
                           cycleInterval === sec
                             ? "bg-cyan-600 text-white"

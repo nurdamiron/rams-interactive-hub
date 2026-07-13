@@ -138,6 +138,14 @@ export const AdminModal: React.FC<AdminModalProps> = ({
       setHwConnected(status.connected);
     };
 
+    // Реальное состояние прошивочного авто-цикла (после ребута ESP32 он ON)
+    const loadAutoCycle = async () => {
+      const state = await hardwareService.getLedAutoCycle();
+      if (state && typeof state.autoCycle === "boolean") {
+        setHwLedAutoCycle(state.autoCycle);
+      }
+    };
+
     const loadTvStatus = async () => {
       const status = await hardwareService.tvGetStatus();
       setTvIP(status.ip || "");
@@ -152,6 +160,7 @@ export const AdminModal: React.FC<AdminModalProps> = ({
     loadHwStatus();
     loadTvStatus();
     loadMapping();
+    loadAutoCycle();
     const interval = setInterval(() => {
       loadHwStatus();
       loadTvStatus();
@@ -530,13 +539,10 @@ export const AdminModal: React.FC<AdminModalProps> = ({
                         onClick={async () => {
                           const newState = !hwLedAutoCycle;
                           setHwLedAutoCycle(newState);
-                          if (newState) {
-                            setHwLedMode("AUTO");
-                            await hardwareService.setLedMode("AUTO");
-                          } else {
-                            // Stop auto-cycle by sending AUTO again (toggle)
-                            await hardwareService.setLedMode("AUTO");
-                          }
+                          if (newState) setHwLedMode("AUTO");
+                          // Явное вкл/выкл прошивочного авто-цикла (не toggle —
+                          // не зависит от рассинхрона состояния после ребута)
+                          await hardwareService.setLedAutoCycle(newState);
                         }}
                         className={`col-span-3 px-3 py-3 rounded-lg text-sm font-bold transition-colors flex items-center justify-center gap-2 ${
                           hwLedAutoCycle

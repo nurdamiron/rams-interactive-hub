@@ -36,7 +36,6 @@
 #include <WebServer.h>
 #include <ArduinoJson.h>
 #include <Adafruit_NeoPixel.h>
-#include <ArduinoOTA.h>
 #include "protocol.h"
 
 // ===================== AP CONFIG (собственная точка доступа) =====================
@@ -62,35 +61,50 @@ const char* STA_PASSWORD = "Rams2021";
 WebServer server(80);
 Adafruit_NeoPixel strip(NUM_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);
 
+// LED-эффекты, safety-таймеры актуаторов и heartbeat к Mega живут в отдельной
+// FreeRTOS-задаче (см. ledSafetyTask), закреплённой за core 0 — отдельно от
+// loopTask (core 1), где WebServer::handleClient() может блокироваться на
+// секунды при неполном/медленном HTTP-запросе (WebServer::_parseRequest
+// делает синхронные readStringUntil() с таймаутом Stream по умолчанию 1000мс
+// на КАЖДУЮ строку заголовка). Без разделения такой залип HTTP-парсинга
+// замораживал и ленту, и защитные таймеры блоков одновременно.
+TaskHandle_t ledSafetyTaskHandle = NULL;
+
+// activeBlockCount и blockStates[] пишутся и из HTTP-хендлеров (loopTask),
+// и из ledSafetyTask (core 0) — защищаем спинлоком, чтобы read-modify-write
+// счётчика активных блоков не гонялся между ядрами (иначе лимит "макс 2
+// актуатора одновременно" можно случайно обойти).
+portMUX_TYPE blockMux = portMUX_INITIALIZER_UNLOCKED;
+
 enum BlockState { STATE_STOP = 0, STATE_UP = 1, STATE_DOWN = -1 };
-BlockState blockStates[TOTAL_BLOCKS + 1];
+volatile BlockState blockStates[TOTAL_BLOCKS + 1];
 
 // Active block tracking (max 2 simultaneous)
-int activeBlockCount = 0;
+volatile int activeBlockCount = 0;
 
 // Block timers — auto-stop after duration
-unsigned long blockStopTime[TOTAL_BLOCKS + 1];
+volatile unsigned long blockStopTime[TOTAL_BLOCKS + 1];
 
 // LED — 8 effects + OFF (IDs match UI: 0=Static,1=Pulse,2=Rainbow,3=Chase,4=Sparkle,5=Wave,6=Fire,7=Meteor)
 enum LedMode { LED_STATIC=0, LED_PULSE=1, LED_RAINBOW=2, LED_CHASE=3, LED_SPARKLE=4, LED_WAVE=5, LED_FIRE=6, LED_METEOR=7, LED_OFF=8 };
-LedMode currentLedMode = LED_RAINBOW;
-uint32_t ledBaseColor   = 0x0000FF;
-uint8_t  ledSpeed       = 128;       // animation speed 0-255
+volatile LedMode currentLedMode = LED_RAINBOW;
+volatile uint32_t ledBaseColor  = 0x0000FF;
+volatile uint8_t  ledSpeed      = 128;       // animation speed 0-255
 unsigned long lastLedUpdate = 0;
 uint16_t animCounter        = 0;
 
 // Auto-cycle: rotate effects every N seconds
 // ВКЛЮЧЕНО по умолчанию — переживает любой рестарт ESP32 (перезагрузка,
-// сбой питания, OTA-обновление), не зависит от Next.js/Electron клиента.
-bool     autoCycleEnabled   = true;
-uint32_t autoCycleInterval  = 60000;  // ms (default 1 minute)
+// сбой питания), не зависит от Next.js/Electron клиента.
+volatile bool     autoCycleEnabled  = true;
+volatile uint32_t autoCycleInterval = 60000;  // ms (default 1 minute)
 unsigned long lastAutoCycle = 0;
 
 // Mega heartbeat
 unsigned long lastHeartbeatMega1 = 0;
 unsigned long lastHeartbeatMega2 = 0;
-bool mega1Alive = false;
-bool mega2Alive = false;
+volatile bool mega1Alive = false;
+volatile bool mega2Alive = false;
 
 // LED segments per block
 struct LedSegment { int start; int count; };
@@ -120,6 +134,7 @@ void ledFire();
 void ledMeteor();
 void highlightBlock(int blockId, uint32_t color);
 void setupRoutes();
+void ledSafetyTask(void* pvParameters);
 
 // ===================== HTTP HELPERS =====================
 void sendJson(int code, JsonDocument& doc) {
@@ -191,26 +206,39 @@ void handleBlock() {
     return;
   }
 
-  // Enforce max 2 simultaneous blocks
+  // Enforce max 2 simultaneous blocks. Critical section: ledSafetyTask (core 0)
+  // can concurrently auto-stop blocks via checkBlockTimers()/checkSafety(),
+  // so the check-then-increment on activeBlockCount must be atomic across cores.
+  portENTER_CRITICAL(&blockMux);
+  bool rejected = false;
   if (action == ACTION_UP && blockStates[blockNum] != STATE_UP) {
     if (activeBlockCount >= 2) {
-      JsonDocument err;
-      err["error"]   = "max 2 blocks active";
-      err["active"]  = activeBlockCount;
-      sendJson(429, err);
-      return;
+      rejected = true;
+    } else {
+      activeBlockCount++;
+      blockStopTime[blockNum] = millis() + duration;
     }
-    activeBlockCount++;
-    blockStopTime[blockNum] = millis() + duration;
   }
   else if (action == ACTION_DOWN && blockStates[blockNum] == STATE_UP) {
     activeBlockCount = max(0, activeBlockCount - 1);
     blockStopTime[blockNum] = 0;
   }
 
-  if      (action == ACTION_UP)   blockStates[blockNum] = STATE_UP;
-  else if (action == ACTION_DOWN) blockStates[blockNum] = STATE_DOWN;
-  else if (action == ACTION_STOP) blockStates[blockNum] = STATE_STOP;
+  if (!rejected) {
+    if      (action == ACTION_UP)   blockStates[blockNum] = STATE_UP;
+    else if (action == ACTION_DOWN) blockStates[blockNum] = STATE_DOWN;
+    else if (action == ACTION_STOP) blockStates[blockNum] = STATE_STOP;
+  }
+  int activeSnapshot = activeBlockCount;
+  portEXIT_CRITICAL(&blockMux);
+
+  if (rejected) {
+    JsonDocument err;
+    err["error"]   = "max 2 blocks active";
+    err["active"]  = activeSnapshot;
+    sendJson(429, err);
+    return;
+  }
 
   routeToMega(blockNum, action);
 
@@ -474,83 +502,66 @@ void setup() {
   server.begin();
   Serial.println("[HTTP] Server started on port 80");
 
-  // ===== OTA (Over-The-Air) Setup =====
-  ArduinoOTA.setHostname("RAMS-ESP32");
-  ArduinoOTA.setPassword("rams2024");
-
-  ArduinoOTA.onStart([]() {
-    Serial.println("[OTA] Update Start");
-    // Stop LED updates during OTA
-    currentLedMode = LED_OFF;
-    strip.clear();
-    strip.show();
-    // Stop all blocks for safety
-    sendAllStop();
-  });
-
-  ArduinoOTA.onEnd([]() {
-    Serial.println("\n[OTA] Update Complete!");
-  });
-
-  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
-    Serial.printf("[OTA] Progress: %u%%\r", (progress / (total / 100)));
-  });
-
-  ArduinoOTA.onError([](ota_error_t error) {
-    Serial.printf("[OTA] Error[%u]: ", error);
-    if      (error == OTA_AUTH_ERROR)    Serial.println("Auth Failed");
-    else if (error == OTA_BEGIN_ERROR)   Serial.println("Begin Failed");
-    else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
-    else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
-    else if (error == OTA_END_ERROR)     Serial.println("End Failed");
-  });
-
-  ArduinoOTA.begin();
-  Serial.println("[OTA] Ready");
-  // ===== End OTA =====
-
   // Ping Megas
   Serial1.println("PING");
   Serial2.println("PING");
   lastHeartbeatMega1 = millis();
   lastHeartbeatMega2 = millis();
 
+  // LED-анимация, safety-таймеры актуаторов и heartbeat к Mega — в отдельной
+  // задаче на core 0, физически отдельно от core 1 (loopTask), где
+  // WebServer::handleClient() может залипнуть на секунды на неполном HTTP-
+  // запросе. Так лента и защита блоков продолжают работать, даже если HTTP
+  // сейчас блокирован кем-то посторонним в сети.
+  xTaskCreatePinnedToCore(
+    ledSafetyTask, "LedSafety", 4096, NULL, 1, &ledSafetyTaskHandle, 0
+  );
+
   Serial.println("[RAMS] Ready!");
   Serial.printf("[RAMS] AP:  http://%s/api/status\n", WiFi.softAPIP().toString().c_str());
   if (WiFi.status() == WL_CONNECTED) {
     Serial.printf("[RAMS] STA: http://%s/api/status\n", WiFi.localIP().toString().c_str());
-    Serial.println("[OTA] Upload: platformio run -t upload --upload-port RAMS-ESP32.local");
   }
 }
 
-// ===================== LOOP =====================
+// ===================== LOOP (core 1) =====================
+// Только HTTP. Может блокироваться на медленном/неполном HTTP-запросе —
+// поэтому лента и safety-таймеры сюда больше не приходят, они в ledSafetyTask.
 void loop() {
-  ArduinoOTA.handle();
   server.handleClient();
-  checkBlockTimers();
-  checkMegaResponses();
-  checkSafety();
+}
 
-  // Auto-cycle effects
-  if (autoCycleEnabled && millis() - lastAutoCycle >= autoCycleInterval) {
-    lastAutoCycle = millis();
-    // Cycle through effects 0-7, skip OFF(8)
-    int next = ((int)currentLedMode + 1) % 8;
-    currentLedMode = (LedMode)next;
-    Serial.printf("[AutoCycle] Switched to effect %d\n", next);
-  }
+// ===================== LED + SAFETY TASK (core 0) =====================
+void ledSafetyTask(void* pvParameters) {
+  unsigned long lastHB = millis();
 
-  if (millis() - lastLedUpdate > 33) {
-    updateLeds();
-    lastLedUpdate = millis();
-  }
+  for (;;) {
+    checkBlockTimers();
+    checkMegaResponses();
+    checkSafety();
 
-  // Heartbeat to Megas every 2 seconds
-  static unsigned long lastHB = 0;
-  if (millis() - lastHB > HEARTBEAT_INTERVAL) {
-    Serial1.println("PING");
-    Serial2.println("PING");
-    lastHB = millis();
+    // Auto-cycle effects
+    if (autoCycleEnabled && millis() - lastAutoCycle >= autoCycleInterval) {
+      lastAutoCycle = millis();
+      // Cycle through effects 0-7, skip OFF(8)
+      int next = ((int)currentLedMode + 1) % 8;
+      currentLedMode = (LedMode)next;
+      Serial.printf("[AutoCycle] Switched to effect %d\n", next);
+    }
+
+    if (millis() - lastLedUpdate > 33) {
+      updateLeds();
+      lastLedUpdate = millis();
+    }
+
+    // Heartbeat to Megas every 2 seconds
+    if (millis() - lastHB > HEARTBEAT_INTERVAL) {
+      Serial1.println("PING");
+      Serial2.println("PING");
+      lastHB = millis();
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(5));
   }
 }
 
@@ -558,10 +569,15 @@ void loop() {
 void checkBlockTimers() {
   unsigned long now = millis();
   for (int i = 1; i <= TOTAL_BLOCKS; i++) {
-    if (blockStates[i] == STATE_UP && blockStopTime[i] > 0 && now >= blockStopTime[i]) {
+    portENTER_CRITICAL(&blockMux);
+    bool expired = blockStates[i] == STATE_UP && blockStopTime[i] > 0 && now >= blockStopTime[i];
+    if (expired) {
       blockStates[i]   = STATE_STOP;
       blockStopTime[i] = 0;
       activeBlockCount = max(0, activeBlockCount - 1);
+    }
+    portEXIT_CRITICAL(&blockMux);
+    if (expired) {
       routeToMega(i, ACTION_STOP);
       Serial.printf("[Timer] Block %d auto-stopped\n", i);
     }
@@ -579,11 +595,13 @@ void routeToMega(int blockId, String action) {
 }
 
 void sendAllStop() {
+  portENTER_CRITICAL(&blockMux);
   for (int i = 1; i <= TOTAL_BLOCKS; i++) {
     blockStates[i]   = STATE_STOP;
     blockStopTime[i] = 0;
   }
   activeBlockCount = 0;
+  portEXIT_CRITICAL(&blockMux);
   Serial1.println("ALL:STOP");
   Serial2.println("ALL:STOP");
   Serial.println("[ALL] STOP");
@@ -591,14 +609,21 @@ void sendAllStop() {
 
 void sendAllDown() {
   for (int i = 1; i <= TOTAL_BLOCKS; i++) {
-    if (blockStates[i] == STATE_UP) {
+    portENTER_CRITICAL(&blockMux);
+    bool wasUp = blockStates[i] == STATE_UP;
+    if (wasUp) {
       blockStates[i]   = STATE_DOWN;
       blockStopTime[i] = 0;
+    }
+    portEXIT_CRITICAL(&blockMux);
+    if (wasUp) {
       routeToMega(i, ACTION_DOWN);
       delay(STAGGER_DELAY_MS);
     }
   }
+  portENTER_CRITICAL(&blockMux);
   activeBlockCount = 0;
+  portEXIT_CRITICAL(&blockMux);
   Serial.println("[ALL] DOWN");
 }
 
@@ -624,20 +649,24 @@ void checkSafety() {
     Serial.println("[SAFETY] Mega#1 heartbeat lost! Stopping blocks 1-8");
     mega1Alive = false;
     Serial1.println("ALL:STOP");
+    portENTER_CRITICAL(&blockMux);
     for (int i = MEGA1_BLOCK_START; i <= MEGA1_BLOCK_END; i++) {
       if (blockStates[i] == STATE_UP) activeBlockCount = max(0, activeBlockCount - 1);
       blockStates[i] = STATE_STOP;
     }
+    portEXIT_CRITICAL(&blockMux);
   }
 
   if (now - lastHeartbeatMega2 > HEARTBEAT_INTERVAL * 3 && mega2Alive) {
     Serial.println("[SAFETY] Mega#2 heartbeat lost! Stopping blocks 9-15");
     mega2Alive = false;
     Serial2.println("ALL:STOP");
+    portENTER_CRITICAL(&blockMux);
     for (int i = MEGA2_BLOCK_START; i <= MEGA2_BLOCK_END; i++) {
       if (blockStates[i] == STATE_UP) activeBlockCount = max(0, activeBlockCount - 1);
       blockStates[i] = STATE_STOP;
     }
+    portEXIT_CRITICAL(&blockMux);
   }
 }
 

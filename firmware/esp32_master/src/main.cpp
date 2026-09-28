@@ -1,5 +1,5 @@
 /**
- * RAMS Kinetic Table — ESP32 Master Firmware v2.1
+ * RAMS Kinetic Table — ESP32 Master Firmware v2.2
  *
  * Режим: AP+STA (dual WiFi)
  *   - Создаёт свою точку доступа RAMS-ESP32 (192.168.4.1) — всегда доступен
@@ -24,18 +24,34 @@
  *   POST /api/bri?v=0-255         → яркость
  *   POST /api/spd?v=0-255         → скорость анимации
  *   POST /api/zones?m=bitmask     → зоны LED
+ *   POST /api/reboot              → безопасная перезагрузка ESP32
  *
  * Подключение:
  *   Serial1 (TX=25, RX=26) → Mega #1 (Blocks 1–8)
  *   Serial2 (TX=16, RX=17) → Mega #2 (Blocks 9–15)
- *   GPIO 23                → WS2812B LED Data
+ *
+ * LED (10 независимых WS2812B лент — ФИНАЛЬНЫЙ маппинг, подтверждён
+ * физическим тестом, см. firmware/PRODUCTION_v3.2_FINAL/esp32/src/rams_controller_v3.ino
+ * — не путать с устаревшей копией на уровень выше в той же папке, там
+ * старый маппинг с GPIO23, с тех пор перепаянным на GPIO4):
+ *  idx  GPIO  Лента
+ *   0    32   Ray 1
+ *   1    22   Ray 2
+ *   2    18   Ray 3
+ *   3    21   Ray 4
+ *   4    13   Ray 5
+ *   5    27   Ray 6
+ *   6     4   Ray 7 (перепаян с GPIO23 на GPIO4)
+ *   7    14   Ray 8
+ *   8     5   Inner circle (64 LED)
+ *   9     2   Outer circle (150 LED)
  */
 
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
 #include <ArduinoJson.h>
-#include <Adafruit_NeoPixel.h>
+#include <FastLED.h>
 #include "protocol.h"
 
 // ===================== AP CONFIG (собственная точка доступа) =====================
@@ -48,8 +64,6 @@ const char* STA_SSID     = "Rams_WIFI";
 const char* STA_PASSWORD = "Rams2021";
 
 // ===================== HARDWARE CONFIG =====================
-#define LED_PIN        23
-#define NUM_LEDS       900
 #define LED_BRIGHTNESS 200
 
 #define MEGA1_TX 25
@@ -57,9 +71,29 @@ const char* STA_PASSWORD = "Rams2021";
 #define MEGA2_TX 16
 #define MEGA2_RX 17
 
+// ===================== LED STRIPS (10 отдельных лент, разные GPIO/длины) =====
+#define NUM_STRIPS 10
+#define MAX_LEDS   150
+static const uint16_t PIN_LEDS[NUM_STRIPS] = { 33, 33, 33, 33, 33, 33, 33, 33, 64, 150 };
+// GPIO для каждой ленты (в том же порядке, что PIN_LEDS): 32,22,18,21,13,27,4,14,5,2
+static CRGB   leds[NUM_STRIPS][MAX_LEDS];
+static uint8_t heat[NUM_STRIPS][MAX_LEDS];  // буфер нагрева для эффекта Fire
+
+// Индексы лент: круги + маппинг лучей на сектора блоков (0-7)
+#define S_INNER 8   // GPIO5, внутренний круг, 64 LED
+#define S_OUTER 9   // GPIO2, внешний круг, 150 LED
+static const uint8_t  RAY[8]         = { 0, 1, 2, 3, 4, 5, 6, 7 };
+static const uint16_t INNER_START[8] = { 16,  8,  0, 56, 47, 40, 33, 24 };
+static const uint16_t INNER_COUNT[8] = {  8,  8,  8,  9,  9,  7,  7,  9 };
+static const uint16_t OUTER_START[8] = {128,106, 84, 62, 38, 18,  0,  0 };
+static const uint16_t OUTER_COUNT[8] = { 22, 22, 22, 22, 24, 20, 18,  0 };
+#define RAY_IN_START   0
+#define RAY_IN_COUNT  18
+#define RAY_OUT_START 18
+#define RAY_OUT_COUNT 15
+
 // ===================== GLOBALS =====================
 WebServer server(80);
-Adafruit_NeoPixel strip(NUM_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);
 
 // LED-эффекты, safety-таймеры актуаторов и heartbeat к Mega живут в отдельной
 // FreeRTOS-задаче (см. ledSafetyTask), закреплённой за core 0 — отдельно от
@@ -90,6 +124,7 @@ enum LedMode { LED_STATIC=0, LED_PULSE=1, LED_RAINBOW=2, LED_CHASE=3, LED_SPARKL
 volatile LedMode currentLedMode = LED_RAINBOW;
 volatile uint32_t ledBaseColor  = 0x0000FF;
 volatile uint8_t  ledSpeed      = 128;       // animation speed 0-255
+volatile uint8_t  ledBrightness = LED_BRIGHTNESS;
 unsigned long lastLedUpdate = 0;
 uint16_t animCounter        = 0;
 
@@ -106,17 +141,6 @@ unsigned long lastHeartbeatMega2 = 0;
 volatile bool mega1Alive = false;
 volatile bool mega2Alive = false;
 
-// LED segments per block
-struct LedSegment { int start; int count; };
-LedSegment blockLeds[TOTAL_BLOCKS + 1] = {
-  {0, 0},
-  {0,  55}, {55,  55}, {110, 55}, {165, 55},
-  {220,55}, {275, 55}, {330, 55},
-  {385,55}, {440, 50}, {490, 50}, {540, 50},
-  {590,50}, {640, 50}, {690, 50},
-  {740,60},
-};
-
 // ===================== FORWARD DECLARATIONS =====================
 void routeToMega(int blockId, String action);
 void sendAllStop();
@@ -132,7 +156,7 @@ void ledChase();
 void ledSparkle();
 void ledFire();
 void ledMeteor();
-void highlightBlock(int blockId, uint32_t color);
+void requestEffectChange(LedMode next);
 void setupRoutes();
 void ledSafetyTask(void* pvParameters);
 
@@ -302,7 +326,7 @@ void handleLed() {
   }
   if (server.hasArg("brightness")) {
     int b = server.arg("brightness").toInt();
-    if (b >= 0 && b <= 255) strip.setBrightness(b);
+    if (b >= 0 && b <= 255) ledBrightness = b;
   }
 
   JsonDocument doc;
@@ -321,6 +345,9 @@ void handleEffect() {
   int id = server.arg("id").toInt();
   if (id >= 0 && id <= 7) {
     currentLedMode = (LedMode)id;
+    if (id == LED_FIRE) {
+      memset(heat, 0, sizeof(heat)); // чистый старт для эффекта огня
+    }
   }
   if (server.hasArg("speed")) {
     ledSpeed = constrain(server.arg("speed").toInt(), 0, 255);
@@ -349,7 +376,7 @@ void handleColor() {
 // POST /api/bri?v=0-255
 void handleBrightness() {
   int v = server.hasArg("v") ? constrain(server.arg("v").toInt(), 0, 255) : 200;
-  strip.setBrightness(v);
+  ledBrightness = v;
   Serial.printf("[LED] Brightness → %d\n", v);
   JsonDocument doc;
   doc["ok"] = true;
@@ -371,7 +398,7 @@ void handleState() {
   doc["r"]   = (ledBaseColor >> 16) & 0xFF;
   doc["g"]   = (ledBaseColor >>  8) & 0xFF;
   doc["b"]   =  ledBaseColor        & 0xFF;
-  doc["bri"] = strip.getBrightness();
+  doc["bri"] = ledBrightness;
   doc["spd"] = ledSpeed;
   doc["fx"]  = (int)currentLedMode;
   doc["zm"]  = 0xFFFF; // all zones active
@@ -417,6 +444,25 @@ void handleGetAutoCycle() {
   sendJson(200, doc);
 }
 
+// POST /api/reboot — безопасная перезагрузка ESP32: сначала останавливает
+// все актуаторы и гасит ленту, затем шлёт HTTP-ответ и перезагружается
+// через ESP.restart() с небольшой задержкой (даёт клиенту время получить ответ).
+void handleReboot() {
+  Serial.println("[API] Reboot requested");
+  sendAllStop();
+  for (int s = 0; s < NUM_STRIPS; s++) fill_solid(leds[s], PIN_LEDS[s], CRGB::Black);
+  FastLED.show();
+
+  JsonDocument doc;
+  doc["ok"] = true;
+  doc["action"] = "reboot";
+  sendJson(200, doc);
+  server.client().flush();
+
+  delay(300);
+  ESP.restart();
+}
+
 // ===================== SETUP ROUTES =====================
 void setupRoutes() {
   server.on("/api/status", HTTP_GET,  handleStatus);
@@ -432,11 +478,13 @@ void setupRoutes() {
   server.on("/api/zones",     HTTP_POST, handleZones);
   server.on("/api/autocycle", HTTP_POST, handleAutoCycle);
   server.on("/api/autocycle", HTTP_GET,  handleGetAutoCycle);
+  server.on("/api/reboot",    HTTP_POST, handleReboot);
 
   // CORS preflight for all endpoints
   const char* endpoints[] = {"/api/block", "/api/all", "/api/stop", "/api/led",
                              "/api/effect", "/api/color", "/api/bri", "/api/spd",
-                             "/api/zones", "/api/state", "/api/status", "/api/autocycle"};
+                             "/api/zones", "/api/state", "/api/status", "/api/autocycle",
+                             "/api/reboot"};
   for (const char* ep : endpoints) {
     server.on(ep, HTTP_OPTIONS, handleOptions);
   }
@@ -456,7 +504,7 @@ void setup() {
   Serial1.begin(SERIAL_BAUD, SERIAL_8N1, MEGA1_RX, MEGA1_TX);
   Serial2.begin(SERIAL_BAUD, SERIAL_8N1, MEGA2_RX, MEGA2_TX);
 
-  Serial.println("\n=== RAMS ESP32 Master v2.0 ===");
+  Serial.println("\n=== RAMS ESP32 Master v2.2 (10-strip LED) ===");
 
   // Initialize block states
   for (int i = 0; i <= TOTAL_BLOCKS; i++) {
@@ -464,11 +512,21 @@ void setup() {
     blockStopTime[i] = 0;
   }
 
-  // LED init
-  strip.begin();
-  strip.setBrightness(LED_BRIGHTNESS);
-  strip.show();
-  Serial.println("[LED] Initialized");
+  // LED init — 10 независимых лент на разных GPIO (pin — compile-time
+  // константа для FastLED, поэтому явные вызовы вместо цикла по массиву)
+  FastLED.addLeds<WS2812B, 32, GRB>(leds[0], PIN_LEDS[0]);  // Ray 1
+  FastLED.addLeds<WS2812B, 22, GRB>(leds[1], PIN_LEDS[1]);  // Ray 2
+  FastLED.addLeds<WS2812B, 18, GRB>(leds[2], PIN_LEDS[2]);  // Ray 3
+  FastLED.addLeds<WS2812B, 21, GRB>(leds[3], PIN_LEDS[3]);  // Ray 4
+  FastLED.addLeds<WS2812B, 13, GRB>(leds[4], PIN_LEDS[4]);  // Ray 5
+  FastLED.addLeds<WS2812B, 27, GRB>(leds[5], PIN_LEDS[5]);  // Ray 6
+  FastLED.addLeds<WS2812B,  4, GRB>(leds[6], PIN_LEDS[6]);  // Ray 7 (перепаян с GPIO23!)
+  FastLED.addLeds<WS2812B, 14, GRB>(leds[7], PIN_LEDS[7]);  // Ray 8
+  FastLED.addLeds<WS2812B,  5, GRB>(leds[8], PIN_LEDS[8]);  // Inner circle (64)
+  FastLED.addLeds<WS2812B,  2, GRB>(leds[9], PIN_LEDS[9]);  // Outer circle (150)
+  FastLED.setBrightness(ledBrightness);
+  FastLED.clear(true);
+  Serial.println("[LED] 10 strips initialized (8 rays + inner + outer circle)");
 
   // ===== WiFi AP+STA dual mode =====
   WiFi.mode(WIFI_AP_STA);
@@ -540,13 +598,16 @@ void ledSafetyTask(void* pvParameters) {
     checkMegaResponses();
     checkSafety();
 
-    // Auto-cycle effects
+    // Auto-cycle effects — переключает эффект каждые autoCycleInterval мс
+    // (по умолчанию 60000 = 1 минута), включено по умолчанию и переживает
+    // любой ребут ESP32, независимо от приложения. Переход плавный —
+    // см. requestEffectChange()/fadeState в updateLeds().
     if (autoCycleEnabled && millis() - lastAutoCycle >= autoCycleInterval) {
       lastAutoCycle = millis();
       // Cycle through effects 0-7, skip OFF(8)
       int next = ((int)currentLedMode + 1) % 8;
-      currentLedMode = (LedMode)next;
-      Serial.printf("[AutoCycle] Switched to effect %d\n", next);
+      requestEffectChange((LedMode)next);
+      Serial.printf("[AutoCycle] Switching to effect %d (fade)\n", next);
     }
 
     if (millis() - lastLedUpdate > 33) {
@@ -670,14 +731,101 @@ void checkSafety() {
   }
 }
 
-// ===================== LED ANIMATION =====================
+// ===================== LED ANIMATION (10 strips) =====================
 // Speed factor: higher ledSpeed = faster animation
-static float speedFactor() { return 0.5f + (ledSpeed / 255.0f) * 3.0f; }
+// ×0.5 — общее замедление всех эффектов вдвое (по просьбе).
+static float speedFactor() { return (0.5f + (ledSpeed / 255.0f) * 3.0f) * 0.5f; }
+
+// Плавный переход при смене эффекта (ручной или автоцикл раз в минуту):
+// гасим яркость к 0, меняем currentLedMode, разгораем обратно — вместо
+// резкого скачка на новый узор. Зоны актуаторов (UP/DOWN) больше не красятся
+// отдельным цветом — они часть той же ленты и просто показывают текущий
+// эффект, как и всё остальное.
+enum FadeState { FADE_NONE, FADE_OUT, FADE_IN };
+FadeState fadeState = FADE_NONE;
+unsigned long fadeStartTime = 0;
+LedMode pendingLedMode = LED_RAINBOW;
+#define FADE_STEP_MS 500
+
+void requestEffectChange(LedMode next) {
+  if (next == currentLedMode) return;
+  pendingLedMode = next;
+  fadeState = FADE_OUT;
+  fadeStartTime = millis();
+}
+
+// Плавная вспышка зоны блока при UP/DOWN — не заливает зону фиксированным
+// цветом (это ломалось на Fire/Sparkle, где цвет разный на каждом пикселе),
+// а осветляет уже нарисованный текущим эффектом цвет каждого пикселя.
+// blockBoost[i] плавно едет к 1.0 пока блок STATE_UP и обратно к 0.0 иначе —
+// поэтому при опускании вспышка сама гаснет, а не залипает (старый баг).
+float blockBoost[TOTAL_BLOCKS + 1] = {0};
+#define BLOCK_BOOST_STEP 0.06f  // ~500мс полного разгорания/затухания при тике ~30мс
+
+static void applyBlockBoost() {
+  for (int i = 1; i <= TOTAL_BLOCKS; i++) {
+    float target = (blockStates[i] == STATE_UP) ? 1.0f : 0.0f;
+    if (blockBoost[i] < target) blockBoost[i] = min(target, blockBoost[i] + BLOCK_BOOST_STEP);
+    else if (blockBoost[i] > target) blockBoost[i] = max(target, blockBoost[i] - BLOCK_BOOST_STEP);
+
+    if (blockBoost[i] <= 0.001f) continue;
+
+    uint8_t blendAmt = (uint8_t)(blockBoost[i] * 140); // максимум ~55% к белому — узнаваемо, не выбеливает
+
+    int sector  = (i - 1) / 2;
+    bool isOuter = (i % 2 == 1);
+    uint8_t L = RAY[sector];
+    uint8_t R = RAY[(sector + 1) % 8];
+
+    auto boost = [&](int s, int idx) {
+      if (idx < 0 || idx >= (int)PIN_LEDS[s]) return;
+      leds[s][idx] = blend(leds[s][idx], CRGB::White, blendAmt);
+    };
+
+    if (i == 15) {
+      for (int j = 0; j < 33; j++) { boost(L, j); boost(R, j); }
+      for (int j = 0; j < (int)INNER_COUNT[sector]; j++) boost(S_INNER, INNER_START[sector] + j);
+    } else if (isOuter) {
+      for (int j = RAY_OUT_START; j < RAY_OUT_START + RAY_OUT_COUNT; j++) { boost(L, j); boost(R, j); }
+      for (int j = 0; j < (int)OUTER_COUNT[sector]; j++) boost(S_OUTER, OUTER_START[sector] + j);
+    } else {
+      for (int j = RAY_IN_START; j < RAY_IN_START + RAY_IN_COUNT; j++) { boost(L, j); boost(R, j); }
+      for (int j = 0; j < (int)INNER_COUNT[sector]; j++) boost(S_INNER, INNER_START[sector] + j);
+      for (int j = 0; j < (int)OUTER_COUNT[sector]; j++) boost(S_OUTER, OUTER_START[sector] + j);
+    }
+  }
+}
 
 void updateLeds() {
   animCounter++;
+
+  uint8_t targetBrightness = ledBrightness;
+  if (fadeState == FADE_OUT) {
+    unsigned long elapsed = millis() - fadeStartTime;
+    if (elapsed >= FADE_STEP_MS) {
+      currentLedMode = pendingLedMode;
+      fadeState = FADE_IN;
+      fadeStartTime = millis();
+      targetBrightness = 0;
+    } else {
+      targetBrightness = (uint16_t)ledBrightness * (FADE_STEP_MS - elapsed) / FADE_STEP_MS;
+    }
+  } else if (fadeState == FADE_IN) {
+    unsigned long elapsed = millis() - fadeStartTime;
+    if (elapsed >= FADE_STEP_MS) {
+      fadeState = FADE_NONE;
+    } else {
+      targetBrightness = (uint16_t)ledBrightness * elapsed / FADE_STEP_MS;
+    }
+  }
+  FastLED.setBrightness(targetBrightness);
+
   switch (currentLedMode) {
-    case LED_STATIC:  strip.fill(ledBaseColor, 0, NUM_LEDS); break;
+    case LED_STATIC: {
+      CRGB c((ledBaseColor >> 16) & 0xFF, (ledBaseColor >> 8) & 0xFF, ledBaseColor & 0xFF);
+      for (int s = 0; s < NUM_STRIPS; s++) fill_solid(leds[s], PIN_LEDS[s], c);
+      break;
+    }
     case LED_PULSE:   ledPulse();   break;
     case LED_RAINBOW: ledRainbow(); break;
     case LED_CHASE:   ledChase();   break;
@@ -685,34 +833,23 @@ void updateLeds() {
     case LED_WAVE:    ledWave();    break;
     case LED_FIRE:    ledFire();    break;
     case LED_METEOR:  ledMeteor();  break;
-    case LED_OFF:     strip.clear(); break;
+    case LED_OFF:
+      for (int s = 0; s < NUM_STRIPS; s++) fill_solid(leds[s], PIN_LEDS[s], CRGB::Black);
+      break;
   }
-  // Soft highlight for DOWN blocks only (UP blocks don't interfere with effects)
-  for (int i = 1; i <= TOTAL_BLOCKS; i++) {
-    if (blockStates[i] == STATE_DOWN) {
-      // Soft orange overlay (30% opacity) - doesn't kill the effect
-      LedSegment seg = blockLeds[i];
-      for (int j = seg.start; j < seg.start + seg.count && j < NUM_LEDS; j++) {
-        uint32_t current = strip.getPixelColor(j);
-        uint8_t r = ((current >> 16) & 0xFF);
-        uint8_t g = ((current >>  8) & 0xFF);
-        uint8_t b = ( current        & 0xFF);
-        // Blend with soft orange (255,80,0) at 30%
-        r = (r * 7 + 255 * 3) / 10;
-        g = (g * 7 +  80 * 3) / 10;
-        b = (b * 7 +   0 * 3) / 10;
-        strip.setPixelColor(j, strip.Color(r, g, b));
-      }
-    }
-  }
-  strip.show();
+
+  applyBlockBoost();
+  FastLED.show();
 }
 
 void ledRainbow() {
   float spd = speedFactor();
-  for (int i = 0; i < NUM_LEDS; i++) {
-    uint16_t hue = (i * 65536L / NUM_LEDS + (uint32_t)(animCounter * spd) * 256) & 0xFFFF;
-    strip.setPixelColor(i, strip.gamma32(strip.ColorHSV(hue)));
+  uint8_t base = (uint8_t)(animCounter * spd);
+  for (int s = 0; s < NUM_STRIPS; s++) {
+    uint16_t n = PIN_LEDS[s];
+    for (uint16_t j = 0; j < n; j++) {
+      leds[s][j] = CHSV(base + (j * 255) / n + s * 25, 255, 255);
+    }
   }
 }
 
@@ -722,107 +859,113 @@ void ledPulse() {
   uint8_t r = ((ledBaseColor >> 16) & 0xFF) * brightness / 255;
   uint8_t g = ((ledBaseColor >>  8) & 0xFF) * brightness / 255;
   uint8_t b = ( ledBaseColor        & 0xFF) * brightness / 255;
-  strip.fill(strip.Color(r, g, b), 0, NUM_LEDS);
+  CRGB c(r, g, b);
+  for (int s = 0; s < NUM_STRIPS; s++) fill_solid(leds[s], PIN_LEDS[s], c);
 }
 
 void ledWave() {
   float spd = speedFactor();
-  for (int i = 0; i < NUM_LEDS; i++) {
-    uint8_t brightness = (sin((i + animCounter * spd) * 0.1f) + 1.0f) * 127;
-    uint8_t r = ((ledBaseColor >> 16) & 0xFF) * brightness / 255;
-    uint8_t g = ((ledBaseColor >>  8) & 0xFF) * brightness / 255;
-    uint8_t b = ( ledBaseColor        & 0xFF) * brightness / 255;
-    strip.setPixelColor(i, strip.Color(r, g, b));
+  uint8_t r = (ledBaseColor >> 16) & 0xFF;
+  uint8_t g = (ledBaseColor >>  8) & 0xFF;
+  uint8_t b =  ledBaseColor        & 0xFF;
+  for (int s = 0; s < NUM_STRIPS; s++) {
+    uint16_t n = PIN_LEDS[s];
+    for (uint16_t j = 0; j < n; j++) {
+      uint8_t brightness = (sin((j + animCounter * spd) * 0.1f) + 1.0f) * 127;
+      leds[s][j] = CRGB(r * brightness / 255, g * brightness / 255, b * brightness / 255);
+    }
   }
 }
 
 void ledChase() {
   float spd = speedFactor();
-  int chaseLen = 20;  // length of lit segment
-  strip.clear();
-  int pos = ((int)(animCounter * spd * 2)) % NUM_LEDS;
   uint8_t r = (ledBaseColor >> 16) & 0xFF;
   uint8_t g = (ledBaseColor >>  8) & 0xFF;
   uint8_t b =  ledBaseColor        & 0xFF;
-  for (int i = 0; i < chaseLen; i++) {
-    int idx = (pos + i) % NUM_LEDS;
-    // Fade tail
-    uint8_t fade = 255 - (i * 255 / chaseLen);
-    strip.setPixelColor(idx, strip.Color(r * fade / 255, g * fade / 255, b * fade / 255));
+  int pos = (int)(animCounter * spd * 2);
+  for (int s = 0; s < NUM_STRIPS; s++) {
+    uint16_t n = PIN_LEDS[s];
+    fill_solid(leds[s], n, CRGB::Black);
+    // ~60% ленты (тюнинг под 33-LED луч: 20/33≈0.6) — масштабируется на
+    // длинные ленты (внутр./внеш. круг), иначе бег виден только на малой
+    // части большого круга и выглядит как "не реагирует".
+    int chaseLen = max(3, min((int)n, (int)(n * 0.6f)));
+    int p = pos % n;
+    for (int i = 0; i < chaseLen; i++) {
+      int idx = (p + i) % n;
+      uint8_t fade = 255 - (i * 255 / chaseLen);
+      leds[s][idx] = CRGB(r * fade / 255, g * fade / 255, b * fade / 255);
+    }
   }
 }
 
 void ledSparkle() {
-  // Dim all pixels slightly
-  for (int i = 0; i < NUM_LEDS; i++) {
-    uint32_t c = strip.getPixelColor(i);
-    uint8_t r = ((c >> 16) & 0xFF) * 220 / 256;
-    uint8_t g = ((c >>  8) & 0xFF) * 220 / 256;
-    uint8_t b = ( c        & 0xFF) * 220 / 256;
-    strip.setPixelColor(i, strip.Color(r, g, b));
-  }
-  // Add random sparkles — more sparkles at higher speed
-  int numSparkles = 1 + ledSpeed / 32;
   uint8_t cr = (ledBaseColor >> 16) & 0xFF;
   uint8_t cg = (ledBaseColor >>  8) & 0xFF;
   uint8_t cb =  ledBaseColor        & 0xFF;
-  for (int s = 0; s < numSparkles; s++) {
-    int idx = random(NUM_LEDS);
-    strip.setPixelColor(idx, strip.Color(cr, cg, cb));
+  // Плотность искр (тюнинг под 33-LED луч), масштабируется по длине ленты —
+  // иначе на 150-LED внешнем круге те же 1-8 искр выглядят почти пусто.
+  // /2 — общее замедление вдвое (по просьбе): реже новые искры.
+  int baseSparkles = max(1, (1 + ledSpeed / 32) / 2);
+  for (int s = 0; s < NUM_STRIPS; s++) {
+    uint16_t n = PIN_LEDS[s];
+    int numSparkles = max(1, baseSparkles * (int)n / 33);
+    for (uint16_t j = 0; j < n; j++) leds[s][j].nscale8(220);
+    for (int k = 0; k < numSparkles; k++) {
+      int idx = random(n);
+      leds[s][idx] = CRGB(cr, cg, cb);
+    }
   }
 }
 
 void ledFire() {
-  for (int i = 0; i < NUM_LEDS; i++) {
-    // Random heat variation
-    uint8_t heat = random(80, 255);
-    // Map heat to fire colors (red → orange → yellow)
-    uint8_t r, g, b;
-    if (heat < 170) {
-      r = heat;
-      g = heat / 3;
-      b = 0;
-    } else {
-      r = 255;
-      g = heat - 80;
-      b = (heat - 170) / 2;
+  // /2 на обоих — общее замедление вдвое (по просьбе): медленнее остывание
+  // (cool) и реже новые искры (spark), т.е. пламя колышется спокойнее.
+  uint8_t cool  = map(ledSpeed, 0, 255, 20, 80) / 2;
+  uint8_t spark = map(ledSpeed, 0, 255, 60, 200) / 2;
+  for (int s = 0; s < NUM_STRIPS; s++) {
+    uint16_t n = PIN_LEDS[s];
+    for (uint16_t j = 0; j < n; j++) {
+      heat[s][j] = qsub8(heat[s][j], random8(0, ((cool * 10) / n) + 2));
     }
-    strip.setPixelColor(i, strip.Color(r, g, b));
+    for (int j = n - 1; j >= 2; j--) {
+      heat[s][j] = ((uint16_t)heat[s][j-1] + heat[s][j-2] + heat[s][j-2]) / 3;
+    }
+    // Зона появления искр — пропорционально длине ленты (тюнинг: 4 из 33 на
+    // луче), иначе на 150-LED круге огонь всегда разгорается только у самого
+    // начала и не успевает заполнить всю ленту.
+    if (random8() < spark) {
+      uint16_t sparkZone = max((uint16_t)4, (uint16_t)(n * 4 / 33));
+      uint8_t y = random8(min(sparkZone, n));
+      heat[s][y] = qadd8(heat[s][y], random8(160, 255));
+    }
+    for (uint16_t j = 0; j < n; j++) {
+      leds[s][j] = HeatColor(heat[s][j]);
+    }
   }
 }
 
 void ledMeteor() {
   float spd = speedFactor();
-  int meteorLen = 30;
-  // Fade all pixels
-  for (int i = 0; i < NUM_LEDS; i++) {
-    uint32_t c = strip.getPixelColor(i);
-    uint8_t r = ((c >> 16) & 0xFF) * 200 / 256;
-    uint8_t g = ((c >>  8) & 0xFF) * 200 / 256;
-    uint8_t b = ( c        & 0xFF) * 200 / 256;
-    // Random decay for organic look
-    if (random(10) > 5) {
-      strip.setPixelColor(i, strip.Color(r, g, b));
-    }
-  }
-  // Draw meteor head
-  int pos = ((int)(animCounter * spd * 3)) % (NUM_LEDS + meteorLen);
   uint8_t cr = (ledBaseColor >> 16) & 0xFF;
   uint8_t cg = (ledBaseColor >>  8) & 0xFF;
   uint8_t cb =  ledBaseColor        & 0xFF;
-  for (int i = 0; i < meteorLen; i++) {
-    int idx = pos - i;
-    if (idx >= 0 && idx < NUM_LEDS) {
-      uint8_t fade = 255 - (i * 255 / meteorLen);
-      strip.setPixelColor(idx, strip.Color(cr * fade / 255, cg * fade / 255, cb * fade / 255));
+  int pos = (int)(animCounter * spd * 3);
+  for (int s = 0; s < NUM_STRIPS; s++) {
+    uint16_t n = PIN_LEDS[s];
+    // ~30% ленты (тюнинг: 10/33≈0.3) — масштабируется, иначе хвост метеора
+    // на 150-LED круге теряется на фоне почти полностью тёмной ленты.
+    int meteorLen = max(3, min((int)n / 2, (int)(n * 0.3f)));
+    for (uint16_t j = 0; j < n; j++) {
+      if (random(10) > 5) leds[s][j].nscale8(200);
     }
-  }
-}
-
-void highlightBlock(int blockId, uint32_t color) {
-  if (blockId < 1 || blockId > TOTAL_BLOCKS) return;
-  LedSegment seg = blockLeds[blockId];
-  for (int i = seg.start; i < seg.start + seg.count && i < NUM_LEDS; i++) {
-    strip.setPixelColor(i, color);
+    int head = pos % (n + meteorLen);
+    for (int i = 0; i < meteorLen; i++) {
+      int idx = head - i;
+      if (idx >= 0 && idx < (int)n) {
+        uint8_t fade = 255 - (i * 255 / meteorLen);
+        leds[s][idx] = CRGB(cr * fade / 255, cg * fade / 255, cb * fade / 255);
+      }
+    }
   }
 }
